@@ -101,6 +101,11 @@ async def create_trip(
         price_per_seat=pricing.price_per_seat,
         total_price=total,
         status=TripStatus.ACTIVE,
+        # ─── Location (yangi) ─────────────────────────────────────────────
+        # Pydantic schema'da paired-validator borligi uchun lat/lng birga keladi.
+        pickup_lat=body.pickup_lat,
+        pickup_lng=body.pickup_lng,
+        pickup_address=body.pickup_address,
     )
     db.add(trip)
     db.commit()

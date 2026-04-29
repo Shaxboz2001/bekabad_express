@@ -22,6 +22,31 @@ def get_me(current_user: User = Depends(get_current_user), db: Session = Depends
     return db.query(User).options(joinedload(User.driver_profile)).filter(User.id == current_user.id).first()
 
 
+@router.get("/me/cached-location")
+def get_cached_location(current_user: User = Depends(get_current_user)):
+    """
+    Telegram orqali yuborilgan oxirgi lokatsiyani qaytaradi (5 daqiqa ichida).
+
+    Frontend NewTripPage'da chaqiriladi — agar foydalanuvchi yaqinda
+    Telegram'da 📍 tugmasini bosgan bo'lsa, lokatsiya avtomatik form'ga
+    to'ldiriladi.
+
+    Read-only — ma'lumot o'chirilmaydi (e'lon yaratilganda consume qilinadi).
+    """
+    from app.services.bot import get_cached_location as bot_get_loc
+    if not current_user.telegram_id:
+        return {"location": None}
+    loc = bot_get_loc(current_user.telegram_id)
+    if not loc:
+        return {"location": None}
+    return {
+        "location": {
+            "lat": loc[0],
+            "lng": loc[1],
+        }
+    }
+
+
 @router.get("/", response_model=list[UserResponse])
 def list_users(
     role: Optional[UserRole] = None,

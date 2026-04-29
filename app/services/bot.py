@@ -1,143 +1,373 @@
 """
-Telegram Bot - aiogram 3.x
+Telegram Bot — aiogram 3.x
 
-Flow:
-  /start   → Salom + WebApp tugmasi (asosiy yo'l)
-  /contact → Agar WebApp'da contact request ishlamasa fallback sifatida
+Asosiy o'zgarishlar (V3):
+  • Polling alohida asyncio.Task'da ishlaydi (FastAPI'ni bloklamaydi)
+  • Detailed logging — har qaysi qadam log'ga yoziladi
+  • Webhook avtomatik tozalanadi (409 Conflict'ni oldini olish)
+  • Diagnostic info bot startup paytida yoziladi
+  • Lokatsiya handler — yo'lovchi joyni yuborsa Redis'ga 5 daqiqaga saqlaydi
+    (keyingi e'lon yaratilganda WebApp avtomatik shu joyni ishlatishi uchun)
+
+Startup pattern (FastAPI lifespan):
+
+    from contextlib import asynccontextmanager
+    from app.services.bot import bot_lifespan
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with bot_lifespan():
+            yield
+
+    app = FastAPI(lifespan=lifespan)
 """
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from typing import Optional
+
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     WebAppInfo, ReplyKeyboardMarkup, KeyboardButton,
-    KeyboardButtonRequestUser, ReplyKeyboardRemove,
 )
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
+
 from app.core.config import settings
 
-bot = Bot(token=settings.BOT_TOKEN) if settings.BOT_TOKEN else None
+logger = logging.getLogger(__name__)
+
+# ─── Singletons ──────────────────────────────────────────────────────────────
+bot: Optional[Bot] = None
 dp = Dispatcher()
+_polling_task: Optional[asyncio.Task] = None
+
+# Lokatsiya cache: {tg_id: (lat, lng, expiry_ts)}
+# Productionda bu Redis'ga ko'chirilishi kerak (multi-instance bo'lsa share qilinmaydi)
+_LOCATION_CACHE: dict[int, tuple[float, float, float]] = {}
+_LOCATION_TTL_SEC = 300  # 5 daqiqa
 
 
+def _init_bot() -> Optional[Bot]:
+    """Bot instance singleton."""
+    global bot
+    if bot is not None:
+        return bot
+    if not settings.BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN .env'da yo'q — bot ishga tushmaydi")
+        return None
+    bot = Bot(
+        token=settings.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    return bot
+
+
+# ─── Klaviaturalar ───────────────────────────────────────────────────────────
 def main_keyboard(webapp_url: str) -> ReplyKeyboardMarkup:
-    """Asosiy WebApp tugmasi."""
     builder = ReplyKeyboardBuilder()
     builder.row(
         KeyboardButton(
-            text="🚕 Ilovani ochish",
+            text="🚕 Иловани очиш",
             web_app=WebAppInfo(url=webapp_url),
         )
     )
-    builder.row(KeyboardButton(text="ℹ️ Yordam"))
+    builder.row(
+        KeyboardButton(text="📍 Жойлашувни юбориш", request_location=True),
+        KeyboardButton(text="ℹ️ Ёрдам"),
+    )
     return builder.as_markup(resize_keyboard=True)
 
 
 def contact_keyboard() -> ReplyKeyboardMarkup:
-    """Telefon ulashish tugmasi (fallback uchun)."""
     builder = ReplyKeyboardBuilder()
     builder.row(
         KeyboardButton(
-            text="📞 Telefon raqamni ulashish",
+            text="📞 Телефон рақамни улашиш",
             request_contact=True,
         )
     )
     return builder.as_markup(resize_keyboard=True, one_time_keyboard=True)
 
 
+# ─── Handlers ────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
+    logger.info(f"/start from user_id={message.from_user.id}")
     user = message.from_user
-    name = user.full_name or user.first_name or "Do'st"
+    name = user.full_name or user.first_name or "Дўст"
+
+    webapp_url = settings.WEBAPP_URL
+    if not webapp_url:
+        await message.answer(
+            f"Салом, <b>{name}</b>! 👋\n\n"
+            "⚠️ Илова URL'и созланмаган. Админ билан боғланинг."
+        )
+        logger.error("WEBAPP_URL settings'da yo'q")
+        return
+
+    if not webapp_url.startswith("https://"):
+        await message.answer(
+            f"Салом, <b>{name}</b>! 👋\n\n"
+            f"⚠️ Илова HTTPS орқали ишлаши керак.\nҲозирги: {webapp_url}\n"
+            "Админ билан боғланинг."
+        )
+        logger.error(f"WEBAPP_URL HTTPS emas: {webapp_url}")
+        return
 
     text = (
-        f"Salom, <b>{name}</b>! 👋\n\n"
-        f"<b>Bekobod Express</b> — Bekobod ↔ Toshkent yo'nalishida "
-        f"qulay va ishonchli safar tizimi.\n\n"
-        f"🚕 Yo'lovchi bo'lib e'lon bering — haydovchilar ko'radi\n"
-        f"🚗 Haydovchi bo'lib ishlang — qo'shimcha daromad\n\n"
-        f"Pastdagi tugmani bosing 👇"
+        f"Салом, <b>{name}</b>! 👋\n\n"
+        f"<b>Bekobod Express</b> — Бекобод ↔ Тошкент йўналишида "
+        f"қулай ва ишончли сафар тизими.\n\n"
+        f"🚕 Йўловчи бўлиб эълон беринг — ҳайдовчилар кўради\n"
+        f"🚗 Ҳайдовчи бўлиб ишланг — қўшимча даромад\n\n"
+        f"Пастдаги тугмани босинг 👇"
     )
-
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=main_keyboard(settings.WEBAPP_URL),
-    )
+    await message.answer(text, reply_markup=main_keyboard(webapp_url))
 
 
-@dp.message(F.text == "ℹ️ Yordam")
+@dp.message(F.text == "ℹ️ Ёрдам")
+@dp.message(Command("help"))
 async def help_handler(message: types.Message):
     text = (
-        "📋 <b>Qo'llanma:</b>\n\n"
-        "1️⃣ <b>Ro'yxatdan o'tish:</b>\n"
-        "   • Yo'lovchi: telefonni ulashing va e'lon bering\n"
-        "   • Haydovchi: telefon + mashina ma'lumotlari kiriting,\n"
-        "     admin tasdiqlagach ishlay olasiz\n\n"
-        "2️⃣ <b>E'lon berish (yo'lovchi):</b>\n"
-        "   Yo'nalish, vaqt, joy sonini tanlang\n"
-        "   Haydovchi qabul qilsa Telegram'ga xabar keladi 📩\n\n"
-        "3️⃣ <b>E'lon qabul qilish (haydovchi):</b>\n"
-        "   Yangi e'lonlar haqida xabar olasiz\n"
-        "   Ilovada qabul qilib, yo'lovchi bilan bog'laning\n\n"
-        "4️⃣ <b>Narxlar:</b>\n"
-        "   Bekobod ↔ Toshkent: avtomatik hisoblanadi\n\n"
-        "📞 Muammo bo'lsa: @bekobod_admin"
+        "📋 <b>Қўлланма:</b>\n\n"
+        "1️⃣ <b>Рўйхатдан ўтиш:</b>\n"
+        "   • Йўловчи: телефонни киритинг ва эълон беринг\n"
+        "   • Ҳайдовчи: телефон + машина маълумотлари,\n"
+        "     админ тасдиқлагач ишлай оласиз\n\n"
+        "2️⃣ <b>Эълон бериш (йўловчи):</b>\n"
+        "   Йўналиш, вақт, жой сонини танланг\n"
+        "   Ҳайдовчи қабул қилса хабар келади 📩\n\n"
+        "3️⃣ <b>Жойлашув юбориш:</b>\n"
+        "   📍 тугмаси орқали ҳозирги жойингизни юборинг.\n"
+        "   Кейин эълон берганда ҳайдовчи аниқ жойни кўради.\n\n"
+        "📞 Муаммо бўлса: @bekobod_admin"
     )
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text)
 
 
 @dp.message(Command("contact"))
 async def contact_request_handler(message: types.Message):
-    """
-    Fallback: agar WebApp'da contact request ishlamasa, bot orqali olamiz.
-    Bu juda kam holatda kerak bo'ladi (eski Telegram clientlari).
-    """
     await message.answer(
-        "Telefon raqamingizni ulashing — biz uni xavfsiz saqlaymiz va "
-        "haydovchilarga ko'rsatamiz (e'lon qabul qilingach).",
+        "Телефон рақамингизни улашинг — биз уни хавфсиз сақлаймиз ва "
+        "ҳайдовчиларга кўрсатамиз (эълон қабул қилингач).",
         reply_markup=contact_keyboard(),
     )
 
 
 @dp.message(F.contact)
 async def contact_received_handler(message: types.Message):
-    """
-    Telefon ulashildi — bu ma'lumotni hozircha faqat tasdiqlash uchun
-    ishlatamiz. Asosiy registratsiya WebApp ichida bo'ladi.
-
-    Production'da: bu yerda backend'ga POST qilib telefonni saqlash kerak,
-    yoki Redis'da `tg_id → phone` mapping qo'yish kerak.
-    """
     contact = message.contact
     if contact.user_id != message.from_user.id:
-        await message.answer("⚠️ Faqat o'z telefoningizni ulashing")
+        await message.answer("⚠️ Фақат ўз телефонингизни улашинг")
         return
+    await message.answer(
+        f"✅ Телефон қабул қилинди: <code>{contact.phone_number}</code>\n\n"
+        f"Энди иловани очинг ва давом этинг 👇",
+        reply_markup=main_keyboard(settings.WEBAPP_URL or ""),
+    )
+
+
+@dp.message(F.location)
+async def location_handler(message: types.Message):
+    """
+    Yo'lovchi telefonidan lokatsiyani yuborganda.
+
+    Strategy:
+      1. Lokatsiya in-memory cache'ga TTL bilan saqlanadi (5 min)
+      2. Foydalanuvchi WebApp'ni ochsa, frontend `/api/v1/users/me/cached-location`
+         endpoint'idan o'qib oladi va NewTripPage'da auto-fill qiladi
+      3. 5 daqiqa ichida e'lon bermasa, lokatsiya o'chiriladi (eskiradi)
+
+    Bu approach Telegram'ning native lokatsiya UX'ini saqlaydi va
+    foydalanuvchi xaritada qayta belgilashi shart emas.
+    """
+    loc = message.location
+    user_id = message.from_user.id
+
+    import time
+    expiry = time.time() + _LOCATION_TTL_SEC
+    _LOCATION_CACHE[user_id] = (loc.latitude, loc.longitude, expiry)
+
+    logger.info(
+        f"Location saved for user_id={user_id}: "
+        f"({loc.latitude:.5f}, {loc.longitude:.5f})"
+    )
 
     await message.answer(
-        f"✅ Telefon qabul qilindi: <code>{contact.phone_number}</code>\n\n"
-        f"Endi ilovani oching va davom eting 👇",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(settings.WEBAPP_URL),
+        f"📍 Жойлашув қабул қилинди\n"
+        f"<code>{loc.latitude:.5f}, {loc.longitude:.5f}</code>\n\n"
+        f"Энди <b>5 дақиқа</b> ичида иловани очинг ва эълон беринг — "
+        f"бу жой автоматик ишлатилади 👇",
+        reply_markup=main_keyboard(settings.WEBAPP_URL or ""),
     )
 
 
 @dp.message(F.web_app_data)
 async def web_app_data_handler(message: types.Message):
-    """Mini App dan kelgan ma'lumotlar (kelajakda kerak bo'lsa)."""
     data = message.web_app_data.data
-    await message.answer(f"✅ Ma'lumot qabul qilindi: {data}")
+    await message.answer(f"✅ Маълумот қабул қилинди: {data}")
 
 
-# ─── Lifecycle ───────────────────────────────────────────────────────────────
+# Generic fallback — ESLATMA: bu eng oxirgi handler bo'lishi shart.
+# Avvalgi handler'lardan birortasi match qilmasa, shu ishlaydi.
+@dp.message()
+async def fallback_handler(message: types.Message):
+    logger.debug(f"Fallback: text={message.text!r} from {message.from_user.id}")
+    await message.answer(
+        "Тушунмадим. /start босинг ёки илова тугмасини босинг 👇",
+        reply_markup=main_keyboard(settings.WEBAPP_URL or ""),
+    )
 
-async def start_bot():
-    """Bot ni ishga tushirish (lifespan'da chaqiriladi)."""
-    if not settings.BOT_TOKEN:
-        print("⚠️  BOT_TOKEN .env da yo'q — bot ishlamaydi")
+
+# ─── Public API: lokatsiya cache'ni o'qish (FastAPI route'lardan chaqiriladi) ─
+def get_cached_location(telegram_id: int) -> Optional[tuple[float, float]]:
+    """
+    Telegram'da yuborilgan oxirgi lokatsiyani qaytaradi (5 daqiqa ichida bo'lsa).
+    Productionda Redis'ga ko'chirilishi kerak.
+    """
+    import time
+    entry = _LOCATION_CACHE.get(telegram_id)
+    if not entry:
+        return None
+    lat, lng, expiry = entry
+    if time.time() > expiry:
+        _LOCATION_CACHE.pop(telegram_id, None)
+        return None
+    return (lat, lng)
+
+
+def consume_cached_location(telegram_id: int) -> Optional[tuple[float, float]]:
+    """E'lon yaratilganda chaqiriladi — bir martalik o'qish."""
+    loc = get_cached_location(telegram_id)
+    if loc:
+        _LOCATION_CACHE.pop(telegram_id, None)
+    return loc
+
+
+# ─── Lifecycle (FastAPI lifespan'dan chaqiriladi) ────────────────────────────
+async def _polling_runner():
+    """
+    Polling forever loop. Background task'da ishlaydi.
+
+    aiogram exception'lari:
+      • TelegramConflictError — boshqa instance polling qilyapti
+      • TelegramUnauthorizedError — token noto'g'ri
+      • Tarmoq xatolari — aiogram avtomatik retry qiladi
+    """
+    b = _init_bot()
+    if b is None:
+        logger.error("Bot instance None — polling boshlanmaydi")
         return
-    print("🤖 Telegram bot ishga tushdi...")
-    await dp.start_polling(bot, skip_updates=True)
+
+    # WEBAPP_URL diagnostika
+    if not settings.WEBAPP_URL:
+        logger.error("⚠️  WEBAPP_URL .env'da yo'q — /start tugmasi ko'rinmaydi")
+    elif not settings.WEBAPP_URL.startswith("https://"):
+        logger.error(
+            f"⚠️  WEBAPP_URL HTTPS emas: {settings.WEBAPP_URL}"
+        )
+
+    # Webhook'ni majburan tozalash — polling boshlanishi uchun shart
+    try:
+        await b.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook tozalandi")
+    except Exception as e:
+        logger.warning(f"Webhook tozalashda xato (e'tiborsiz): {e}")
+
+    # Bot identifikatsiyasi — token to'g'ri ekanligini tasdiqlaydi
+    try:
+        me = await b.get_me()
+        logger.info(
+            f"🤖 Bot @{me.username} (id={me.id}) ishga tushdi. "
+            f"WebApp: {settings.WEBAPP_URL}"
+        )
+    except TelegramUnauthorizedError:
+        logger.error(
+            "❌ BOT_TOKEN noto'g'ri (401 Unauthorized). "
+            ".env'da BOT_TOKEN'ni tekshiring."
+        )
+        return
+    except Exception as e:
+        logger.error(
+            f"❌ Telegram API'ga bog'lanib bo'lmadi: {e}\n"
+            "Tarmoq sozlamalarini tekshiring (firewall, proxy)."
+        )
+        return
+
+    # Polling — forever loop
+    try:
+        logger.info("📡 Bot polling boshlanyapti...")
+        await dp.start_polling(
+            b,
+            allowed_updates=dp.resolve_used_update_types(),
+            handle_signals=False,  # FastAPI o'z signal handler'ini ishlatadi
+        )
+    except TelegramConflictError as e:
+        logger.error(
+            f"❌ 409 Conflict: boshqa Bot instance polling qilyapti.\n"
+            f"  • Faqat 1 ta jarayonda bot ishga tushiring\n"
+            f"  • Eski docker container'ni o'chiring: docker ps && docker kill <id>\n"
+            f"Detail: {e}"
+        )
+    except asyncio.CancelledError:
+        logger.info("Bot polling cancelled (graceful shutdown)")
+        raise
+    except Exception as e:
+        logger.exception(f"❌ Bot polling crash: {e}")
+
+
+@asynccontextmanager
+async def bot_lifespan():
+    """
+    FastAPI lifespan'da ishlatiladigan async context manager.
+
+    Pattern:
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            async with bot_lifespan():
+                yield
+
+    `start_polling` forever loop bo'lgani uchun uni `asyncio.create_task`
+    ichida ishga tushiramiz — bu FastAPI'ni bloklamaydi.
+    """
+    global _polling_task
+
+    # Polling'ni alohida task'da ishga tushiramiz
+    _polling_task = asyncio.create_task(_polling_runner(), name="bot-polling")
+    logger.info("Bot polling task yaratildi")
+
+    try:
+        yield
+    finally:
+        # Graceful shutdown
+        if _polling_task and not _polling_task.done():
+            logger.info("Bot polling to'xtatilmoqda...")
+            _polling_task.cancel()
+            try:
+                await asyncio.wait_for(_polling_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        if bot:
+            await bot.session.close()
+            logger.info("Bot session yopildi")
+
+
+# ─── Backward compatibility ──────────────────────────────────────────────────
+# Eski `start_bot()`/`stop_bot()` chaqiriladigan joylar uchun
+async def start_bot():
+    """DEPRECATED: bot_lifespan() ishlating."""
+    logger.warning("start_bot() deprecated. Use bot_lifespan() in FastAPI lifespan.")
+    await _polling_runner()
 
 
 async def stop_bot():
+    """DEPRECATED: bot_lifespan() ishlating."""
+    if _polling_task and not _polling_task.done():
+        _polling_task.cancel()
     if bot:
         await bot.session.close()
