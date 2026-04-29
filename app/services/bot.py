@@ -45,11 +45,6 @@ bot: Optional[Bot] = None
 dp = Dispatcher()
 _polling_task: Optional[asyncio.Task] = None
 
-# Lokatsiya cache: {tg_id: (lat, lng, expiry_ts)}
-# Productionda bu Redis'ga ko'chirilishi kerak (multi-instance bo'lsa share qilinmaydi)
-_LOCATION_CACHE: dict[int, tuple[float, float, float]] = {}
-_LOCATION_TTL_SEC = 300  # 5 daqiqa
-
 
 def _init_bot() -> Optional[Bot]:
     """Bot instance singleton."""
@@ -68,6 +63,12 @@ def _init_bot() -> Optional[Bot]:
 
 # ─── Klaviaturalar ───────────────────────────────────────────────────────────
 def main_keyboard(webapp_url: str) -> ReplyKeyboardMarkup:
+    """
+    Asosiy klaviatura — faqat WebApp va Yordam.
+
+    Lokatsiya tugmasi YO'Q: lokatsiya WebApp ichida `tg.LocationManager`
+    orqali olinadi (e'lon berish paytida).
+    """
     builder = ReplyKeyboardBuilder()
     builder.row(
         KeyboardButton(
@@ -75,10 +76,7 @@ def main_keyboard(webapp_url: str) -> ReplyKeyboardMarkup:
             web_app=WebAppInfo(url=webapp_url),
         )
     )
-    builder.row(
-        KeyboardButton(text="📍 Жойлашувни юбориш", request_location=True),
-        KeyboardButton(text="ℹ️ Ёрдам"),
-    )
+    builder.row(KeyboardButton(text="ℹ️ Ёрдам"))
     return builder.as_markup(resize_keyboard=True)
 
 
@@ -139,11 +137,12 @@ async def help_handler(message: types.Message):
         "   • Ҳайдовчи: телефон + машина маълумотлари,\n"
         "     админ тасдиқлагач ишлай оласиз\n\n"
         "2️⃣ <b>Эълон бериш (йўловчи):</b>\n"
-        "   Йўналиш, вақт, жой сонини танланг\n"
-        "   Ҳайдовчи қабул қилса хабар келади 📩\n\n"
-        "3️⃣ <b>Жойлашув юбориш:</b>\n"
-        "   📍 тугмаси орқали ҳозирги жойингизни юборинг.\n"
-        "   Кейин эълон берганда ҳайдовчи аниқ жойни кўради.\n\n"
+        "   • Илова ичида йўналиш, вақт, жойни танланг\n"
+        "   • 📍 тугмаси орқали айни жойингизни юборишингиз мумкин\n"
+        "   • Ҳайдовчи қабул қилса, хабар келади 📩\n\n"
+        "3️⃣ <b>Эълон қабул қилиш (ҳайдовчи):</b>\n"
+        "   Янги эълонлар ҳақида хабар оласиз\n"
+        "   Илова ичида қабул қилинг\n\n"
         "📞 Муаммо бўлса: @bekobod_admin"
     )
     await message.answer(text)
@@ -174,34 +173,15 @@ async def contact_received_handler(message: types.Message):
 @dp.message(F.location)
 async def location_handler(message: types.Message):
     """
-    Yo'lovchi telefonidan lokatsiyani yuborganda.
+    Eski tugma yoki Telegram menyusidan lokatsiya yuborilgan bo'lsa.
 
-    Strategy:
-      1. Lokatsiya in-memory cache'ga TTL bilan saqlanadi (5 min)
-      2. Foydalanuvchi WebApp'ni ochsa, frontend `/api/v1/users/me/cached-location`
-         endpoint'idan o'qib oladi va NewTripPage'da auto-fill qiladi
-      3. 5 daqiqa ichida e'lon bermasa, lokatsiya o'chiriladi (eskiradi)
-
-    Bu approach Telegram'ning native lokatsiya UX'ini saqlaydi va
-    foydalanuvchi xaritada qayta belgilashi shart emas.
+    Yangi flow: lokatsiya WebApp ichida `tg.LocationManager` orqali
+    olinadi (e'lon berish paytida). Bu yerda faqat foydalanuvchini
+    iliuzaga yo'naltiramiz.
     """
-    loc = message.location
-    user_id = message.from_user.id
-
-    import time
-    expiry = time.time() + _LOCATION_TTL_SEC
-    _LOCATION_CACHE[user_id] = (loc.latitude, loc.longitude, expiry)
-
-    logger.info(
-        f"Location saved for user_id={user_id}: "
-        f"({loc.latitude:.5f}, {loc.longitude:.5f})"
-    )
-
     await message.answer(
-        f"📍 Жойлашув қабул қилинди\n"
-        f"<code>{loc.latitude:.5f}, {loc.longitude:.5f}</code>\n\n"
-        f"Энди <b>5 дақиқа</b> ичида иловани очинг ва эълон беринг — "
-        f"бу жой автоматик ишлатилади 👇",
+        "📍 Жойлашув илова ичида автоматик олинади.\n\n"
+        "Иловани очинг ва эълон бераётганда «📍 Айни жойим» тугмасини босинг 👇",
         reply_markup=main_keyboard(settings.WEBAPP_URL or ""),
     )
 
@@ -223,29 +203,16 @@ async def fallback_handler(message: types.Message):
     )
 
 
-# ─── Public API: lokatsiya cache'ni o'qish (FastAPI route'lardan chaqiriladi) ─
-def get_cached_location(telegram_id: int) -> Optional[tuple[float, float]]:
-    """
-    Telegram'da yuborilgan oxirgi lokatsiyani qaytaradi (5 daqiqa ichida bo'lsa).
-    Productionda Redis'ga ko'chirilishi kerak.
-    """
-    import time
-    entry = _LOCATION_CACHE.get(telegram_id)
-    if not entry:
-        return None
-    lat, lng, expiry = entry
-    if time.time() > expiry:
-        _LOCATION_CACHE.pop(telegram_id, None)
-        return None
-    return (lat, lng)
+# ─── Public API: hozircha kerak emas ─────────────────────────────────────────
+# Avvalgi versiyada bot orqali yuborilgan lokatsiyani cache'lash bor edi.
+# Endi lokatsiya WebApp ichida olinadi, shuning uchun bu kerak emas.
+# Backward compat uchun stub qoldiramiz (chaqiruvchi kod crash bo'lmasligi uchun).
+def get_cached_location(telegram_id: int):
+    return None
 
 
-def consume_cached_location(telegram_id: int) -> Optional[tuple[float, float]]:
-    """E'lon yaratilganda chaqiriladi — bir martalik o'qish."""
-    loc = get_cached_location(telegram_id)
-    if loc:
-        _LOCATION_CACHE.pop(telegram_id, None)
-    return loc
+def consume_cached_location(telegram_id: int):
+    return None
 
 
 # ─── Lifecycle (FastAPI lifespan'dan chaqiriladi) ────────────────────────────

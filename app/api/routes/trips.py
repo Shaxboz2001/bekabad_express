@@ -87,7 +87,10 @@ async def create_trip(
 
     total = pricing.price_per_seat * body.seats
 
-    trip = Trip(
+    # Trip kwargs — model'da qaysi field'lar borligini tekshirib qo'shamiz
+    # Bu schema va model alohida tezlikda yangilansa ham (graceful degradation)
+    # crash bo'lmaydi.
+    trip_kwargs = dict(
         passenger_id=current_user.id,
         direction=body.direction,
         pickup_point=body.pickup_point,
@@ -101,15 +104,16 @@ async def create_trip(
         price_per_seat=pricing.price_per_seat,
         total_price=total,
         status=TripStatus.ACTIVE,
-        # ─── Location (yangi, ixtiyoriy) ──────────────────────────────────
-        # `getattr` ishlatamiz — schema hali yangilanmagan bo'lsa AttributeError
-        # bo'lmaydi. Schema yangilangach to'g'ridan-to'g'ri body.pickup_lat ham
-        # ishlaydi. Trip model'da bu field'lar bo'lmasa, bu argumentlarni
-        # commentga oling yoki Trip model'iga avval field qo'shing.
-        pickup_lat=getattr(body, 'pickup_lat', None),
-        pickup_lng=getattr(body, 'pickup_lng', None),
-        pickup_address=getattr(body, 'pickup_address', None),
     )
+
+    # Location — faqat Trip model'da field bor bo'lsa qo'shamiz
+    # (hasattr SQLAlchemy mapped column'ni tekshiradi)
+    if hasattr(Trip, 'pickup_lat'):
+        trip_kwargs['pickup_lat'] = getattr(body, 'pickup_lat', None)
+        trip_kwargs['pickup_lng'] = getattr(body, 'pickup_lng', None)
+        trip_kwargs['pickup_address'] = getattr(body, 'pickup_address', None)
+
+    trip = Trip(**trip_kwargs)
     db.add(trip)
     db.commit()
     db.refresh(trip)
