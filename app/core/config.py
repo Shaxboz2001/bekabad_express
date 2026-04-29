@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
     BOT_TOKEN: str = ""
-    WEBAPP_URL: str = "http://localhost:3000"
+    WEBAPP_URL: str = "https://bekobod-express-frontend.vercel.app"
     ADMIN_WEBAPP_URL: str = "http://localhost:3001"
 
     BACKEND_CORS_ORIGINS: str = '["http://localhost:3000","http://localhost:3001"]'
