@@ -1,121 +1,164 @@
 """
-Trip schemas — location field'lari bilan kengaytirilgan.
+PATCH: TripCreate schema'sida pickup_lat/pickup_lng/pickup_address qo'shish
+==========================================================================
 
-Sizning mavjud `app/schemas/trip.py` ichida quyidagi o'zgarishlarni qiling:
+XATO:
+  AttributeError: 'TripCreate' object has no attribute 'pickup_lat'
 
-1. TripBase / TripCreate / TripResponse — pickup_lat, pickup_lng, pickup_address qo'shing
-2. Validator: agar bittasi berilsa, ikkalasi ham bo'lishi shart
-3. O'zbekiston bbox tekshirish
+SABAB:
+  trips.py'da `body.pickup_lat` o'qiladi, lekin sizning Pydantic schema'ngizda
+  bu field yo'q. Schema'ni yangilash kerak.
 
-Pastda to'liq namuna kod.
+ECHIM:
+  Sizning `app/schemas/trip.py` (yoki qayerda TripCreate yozilgan bo'lsa)
+  ichida quyidagi o'zgarishlarni qiling.
 """
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QADAM 1: Imports'ga qo'shing
+# ═══════════════════════════════════════════════════════════════════════════
+from typing import Optional
+from pydantic import BaseModel, Field, model_validator
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QADAM 2: TripBase yoki TripCreate class'iga 3 ta field qo'shing
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# AVVAL (sizning hozirgi kodingiz, taxminan):
+#
+#     class TripCreate(BaseModel):
+#         direction: str
+#         pickup_point: str
+#         dropoff_point: str
+#         trip_date: datetime
+#         seats: int
+#         category: str
+#         car_type_preference: Optional[str] = 'any'
+#         notes: Optional[str] = None
+#         luggage: bool = False
+#
+#
+# KEYIN (yangi):
+#
+#     class TripCreate(BaseModel):
+#         direction: str
+#         pickup_point: str
+#         dropoff_point: str
+#         trip_date: datetime
+#         seats: int
+#         category: str
+#         car_type_preference: Optional[str] = 'any'
+#         notes: Optional[str] = None
+#         luggage: bool = False
+#
+#         # ▼▼▼ YANGI ▼▼▼
+#         pickup_lat: Optional[float] = Field(None, ge=37.0, le=46.0)
+#         pickup_lng: Optional[float] = Field(None, ge=55.0, le=74.0)
+#         pickup_address: Optional[str] = Field(None, max_length=500)
+#
+#         @model_validator(mode='after')
+#         def coords_paired(self):
+#             if (self.pickup_lat is None) != (self.pickup_lng is None):
+#                 raise ValueError(
+#                     'pickup_lat va pickup_lng yo ikkalasi ham, yo hech qaysi'
+#                 )
+#             return self
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QADAM 3: TripResponse'ga ham qo'shing (haydovchi xaritani ko'rishi uchun)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#     class TripResponse(BaseModel):
+#         id: int
+#         direction: str
+#         pickup_point: str
+#         # ... boshqa field'lar ...
+#
+#         # ▼▼▼ YANGI ▼▼▼
+#         pickup_lat: Optional[float] = None
+#         pickup_lng: Optional[float] = None
+#         pickup_address: Optional[str] = None
+#
+#         class Config:
+#             from_attributes = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QADAM 4: Trip SQLAlchemy modelda field'lar borligini tekshiring
+# ═══════════════════════════════════════════════════════════════════════════
+# Agar `app/models/trip.py`'da bu field'lar yo'q bo'lsa, ham xato bo'ladi
+# (pickup_lat=... argument berib bo'lmaydi).
+#
+# Trip model'iga (app/models/trip.py) qo'shing:
+#
+#     from sqlalchemy import Column, Float, String
+#
+#     class Trip(Base):
+#         __tablename__ = 'trips'
+#         # ... mavjud field'lar ...
+#
+#         # ▼▼▼ YANGI ▼▼▼
+#         pickup_lat = Column(Float, nullable=True)
+#         pickup_lng = Column(Float, nullable=True)
+#         pickup_address = Column(String(500), nullable=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QADAM 5: DB migration ishga tushiring
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   psql -U postgres -d <db_name> < patches/001_add_location.sql
+#
+# YOKI Alembic'da:
+#
+#   alembic revision --autogenerate -m "add trip location fields"
+#   alembic upgrade head
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# QADAM 6: Backend restart
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   systemctl restart bekobod-backend
+#   # yoki
+#   sudo supervisorctl restart bekobod
+#   # yoki
+#   docker-compose restart backend
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# To'liq ishlovchi namuna (siz to'g'ridan-to'g'ri ishlatishingiz mumkin):
+# ═══════════════════════════════════════════════════════════════════════════
+
 from datetime import datetime
-from typing import Optional, List
-from pydantic import BaseModel, Field, field_validator, model_validator
-
-
-# O'zbekiston bbox (extra security layer Pydantic'da)
-UZ_LAT_MIN, UZ_LAT_MAX = 37.0, 46.0
-UZ_LNG_MIN, UZ_LNG_MAX = 55.0, 74.0
 
 
 class TripBase(BaseModel):
-    direction: str  # 'bekobod_to_tashkent' | 'tashkent_to_bekobod'
+    direction: str
     pickup_point: str = Field(..., min_length=2, max_length=500)
     dropoff_point: str = Field(..., min_length=2, max_length=500)
     trip_date: datetime
     seats: int = Field(..., ge=1, le=20)
-    category: str  # 'passenger' | 'passenger_small_cargo' | 'cargo'
+    category: str
     car_type_preference: Optional[str] = 'any'
     notes: Optional[str] = Field(None, max_length=1000)
     luggage: bool = False
 
-    # ─── Location fields (YANGI) ────────────────────────────────────────────
-    pickup_lat: Optional[float] = Field(
-        None, ge=UZ_LAT_MIN, le=UZ_LAT_MAX,
-        description="Yo'lovchi belgilagan koordinata (latitude)",
-    )
-    pickup_lng: Optional[float] = Field(
-        None, ge=UZ_LNG_MIN, le=UZ_LNG_MAX,
-        description="Yo'lovchi belgilagan koordinata (longitude)",
-    )
-    pickup_address: Optional[str] = Field(
-        None, max_length=500,
-        description="Reverse geocoding orqali olingan manzil (opsional)",
-    )
+    # Location field'lari — barchasi optional, paired
+    pickup_lat: Optional[float] = Field(None, ge=37.0, le=46.0)
+    pickup_lng: Optional[float] = Field(None, ge=55.0, le=74.0)
+    pickup_address: Optional[str] = Field(None, max_length=500)
 
     @model_validator(mode='after')
     def coords_paired(self):
-        """lat va lng birga bo'lishi yoki ikkalasi ham None"""
         if (self.pickup_lat is None) != (self.pickup_lng is None):
             raise ValueError(
-                "pickup_lat va pickup_lng — yo ikkalasi ham, yo hech qaysi"
+                'pickup_lat va pickup_lng yo ikkalasi ham, yo hech qaysi'
             )
         return self
 
 
 class TripCreate(TripBase):
-    """Yangi trip yaratish uchun (POST /api/v1/trips)."""
     pass
-
-
-class TripUpdate(BaseModel):
-    """Statusni o'zgartirish uchun (PATCH /api/v1/trips/{id})."""
-    status: Optional[str] = None
-    cancellation_reason: Optional[str] = Field(None, max_length=500)
-
-
-class UserMini(BaseModel):
-    """Trip ichida embed bo'lgan user info."""
-    id: int
-    full_name: str
-    phone: Optional[str] = None
-    username: Optional[str] = None
-    telegram_id: Optional[int] = None
-
-    class Config:
-        from_attributes = True
-
-
-class DriverProfileMini(BaseModel):
-    car_model: str
-    car_number: str
-    car_color: Optional[str] = None
-    car_year: Optional[int] = None
-    car_type: str
-    seats_available: int
-    rating: float = 5.0
-    total_trips: int = 0
-
-    class Config:
-        from_attributes = True
-
-
-class DriverWithProfile(UserMini):
-    driver_profile: Optional[DriverProfileMini] = None
-
-
-class TripResponse(TripBase):
-    id: int
-    passenger_id: int
-    driver_id: Optional[int] = None
-    status: str
-    price_per_seat: float
-    total_price: float
-    cancellation_reason: Optional[str] = None
-    created_at: datetime
-    updated_at: Optional[datetime] = None
-
-    # Embed qilingan user'lar — frontend kontaktni ko'rsatishi uchun
-    passenger: Optional[UserMini] = None
-    driver: Optional[DriverWithProfile] = None
-
-    class Config:
-        from_attributes = True
-
-
-class TripListResponse(BaseModel):
-    items: List[TripResponse]
-    total: int
-    page: int
-    size: int

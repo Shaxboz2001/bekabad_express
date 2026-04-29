@@ -101,11 +101,14 @@ async def create_trip(
         price_per_seat=pricing.price_per_seat,
         total_price=total,
         status=TripStatus.ACTIVE,
-        # ─── Location (yangi) ─────────────────────────────────────────────
-        # Pydantic schema'da paired-validator borligi uchun lat/lng birga keladi.
-        pickup_lat=body.pickup_lat,
-        pickup_lng=body.pickup_lng,
-        pickup_address=body.pickup_address,
+        # ─── Location (yangi, ixtiyoriy) ──────────────────────────────────
+        # `getattr` ishlatamiz — schema hali yangilanmagan bo'lsa AttributeError
+        # bo'lmaydi. Schema yangilangach to'g'ridan-to'g'ri body.pickup_lat ham
+        # ishlaydi. Trip model'da bu field'lar bo'lmasa, bu argumentlarni
+        # commentga oling yoki Trip model'iga avval field qo'shing.
+        pickup_lat=getattr(body, 'pickup_lat', None),
+        pickup_lng=getattr(body, 'pickup_lng', None),
+        pickup_address=getattr(body, 'pickup_address', None),
     )
     db.add(trip)
     db.commit()
